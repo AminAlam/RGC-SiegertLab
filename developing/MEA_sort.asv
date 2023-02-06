@@ -1,0 +1,234 @@
+function MEA_sort(input_file)
+
+clear fid
+clear ans
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PATHS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+archive_path = "/home/malamalh/mounts/drives/archive-siegegrp";
+fs3_path = "/home/malamalh/mounts/drives/fs3";
+kilosort_path = "/home/malamalh/Documents/RGC/Kilosort";
+npy_matlab_path = kilosort_path+"/npy-matlab";
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% split the filenames into parts that matter
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+fprintf('Opening %s \n', input_file)
+fid = fopen(input_file);
+data = textscan(fid,'%s');
+fclose(fid);
+data = string(data{:});
+clear fid
+clear ans
+
+experiment_name    = string(data(1));
+route_name         = string(data(2));
+fprintf(experiment_name)
+
+fname = {};
+for i_idx = 1:length(data)
+    trace_name = string(data(i_idx));
+    trace_char = char(data(i_idx));
+    if length(trace_char)>5
+        if trace_char(1:5) == 'Trace'
+            fname{end+1} = trace_name;
+        end
+    end
+end
+
+year               = char(experiment_name);
+year               = year(1:4);
+
+fprintf('Analysing %s of %s \n', string(route_name), string(experiment_name))
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Declare all the folders
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+addpath(genpath(kilosort_path)) % path to kilosort folder
+addpath(npy_matlab_path) % for converting to Phy
+rootD                  = fs3_path + '/Balint_RESTORED/Balint/MEA/'+string(year)+'/'+string(experiment_name)+'/'; % path to the original h5 files
+rootZ                  = archive_path + '/KiloSort_dump/res/'; % the raw data binary file is in this folder
+rootH                  = archive_path + '/KiloSort_dump/res/'; % path to temporary binary file (same size as data, should be on fast SSD)
+rootO                  = archive_path + '/MEA_traces/'+string(experiment_name)+'/'; % path to the binary file
+pathToYourConfigFile   = '/nfs/scistore12/siegegrp/rcubero/KiloSort/configFiles'; % take from Github folder and put it somewhere else (together with the master_file)
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Create the output folder, if it doesn't exist yet
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+output_fname = string(experiment_name);
+if exist(rootZ+output_fname,'dir')
+    fprintf('%s%s already exists.. No need to create new folder.. \n', rootZ, output_fname)
+else
+    mkdir(rootZ+output_fname);
+end
+
+if exist(rootZ+output_fname+'/'+route_name,'dir')
+    fprintf('%s%s/%s already exists.. No need to create new folder.. \n', rootZ, output_fname, route_name)
+else
+    mkdir(rootZ+output_fname+'/'+route_name);
+end
+
+rootZ                  = rootZ+output_fname+'/'+route_name+'/'; % rename rootZ
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Run configuration file
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+fs                                                                                                                 = 20000; % sampling frequency
+ops.fs                        = fs;
+ops.trange                    = [0 Inf]; % time range to sort
+ops.criterionNoiseChannels    = 0.5; 
+
+fprintf('Running configFile384.m \n')
+run(fullfile(pathToYourConfigFile, 'configFile384_drift.m'))
+ops.fproc       = char(fullfile(rootH, 'temp_wh.dat')); % proc file on a fast SSD
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Create mini-patches and channel map file
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+fprintf('Creating channel map file \n')
+fn                       = rootD+fname{1};
+mapping                  = h5read(fullfile(fn), '/mapping');
+
+% Create mini-patches
+radius = 200;
+valid_idx = mapping.x>=0;
+
+x                        = mapping.x;
+y                        = mapping.y;
+ch                       = mapping.channel(valid_idx);
+electrode                = mapping.electrode(valid_idx);
+
+[~, sorted]              = sort(electrode, 'ascend');
+xcoords                  = x(sorted);
+ycoords                  = y(sorted);
+
+Nchannels                = length(ch);
+connected                = true(Nchannels, 1);
+chanMap                  = 1:Nchannels;
+chanMap0ind              = chanMap - 1;
+
+kcoords                  = ones(length(mapping.x),1);
+
+all_used_channels = [];
+iteration = 1;
+while sum(valid_idx)>0
+    % find upper left corner
+    x = mapping.x(valid_idx);
+    y = mapping.y(valid_idx);
+    ch = mapping.channel(valid_idx);
+
+    [~,b] = sort( sqrt( x.^2 + y.^2 ) );
+    topPoint_x = x(b(1));
+    topPoint_y = y(b(1));
+
+    [d,b] = sort( sqrt( (topPoint_x-x).^2 + (topPoint_y-y).^2 ) );
+    rng = d<radius;
+    idx = b(rng);
+    
+    all_used_channels = [all_used_channels ; ch(idx)];
+
+    for m_idx = 1:length(mapping.channel)
+        if any( all_used_channels==mapping.channel(m_idx) )
+            valid_idx(m_idx) = 0;
+        end
+        
+        if any( ch(idx)==mapping.channel(m_idx) )
+            kcoords(m_idx) = iteration;
+        end
+    end
+    iteration=iteration + 1;
+end
+
+kcoords = kcoords(sorted);
+fprintf('There are %d clusters \n', length(unique(kcoords)))
+
+
+chanMapFile = output_fname+'_ChanMap.mat';
+save(fullfile(pathToYourConfigFile, chanMapFile), 'chanMap','connected', 'xcoords', 'ycoords', 'kcoords', 'chanMap0ind', 'fs')
+
+ops.chanMap     = char(fullfile(pathToYourConfigFile, chanMapFile));
+ops.NchanTOT    = Nchannels; % total number of channels in your recording
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% save the binary file and load it
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+binary_filename  = route_name+'.bin';
+fs               = rootZ+binary_filename;
+
+if exist(fs)
+    fprintf('%s is already there.. No need to copy.. \n', binary_filename)
+else
+    concat_cmd = 'cat ';
+    for i_idx = 1:length(fname)
+        trace_name = char(fname{i_idx})
+        if string(trace_name(end-2:end)) == '.h5'
+            concat_cmd = concat_cmd+rootO+extractBefore(fname{i_idx},'.h5')+'.bin ';
+        end
+    end
+    concat_cmd = concat_cmd+'> '+fs;
+    disp(concat_cmd);
+    system(concat_cmd);
+end
+
+ops.fbinary = fullfile(fs);
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% start the spike sorting
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+gpuDevice(1);
+
+% this block runs all the steps of the algorithm
+fprintf('Looking for data inside %s \n', rootZ)
+
+% preprocess data to create temp_wh.dat
+fprintf('preprocess data to create temp_wh.dat \n')
+rez                = preprocessDataSub(ops);
+rez                = datashift2(rez, 1);
+
+% main tracking and template matching algorithm
+fprintf('main tracking and template matching algorithm \n')
+[rez, st3, tF]     = extract_spikes(rez);
+rez                = template_learning(rez, tF, st3);
+[rez, st3, tF]     = trackAndSort(rez);
+
+% final clustering
+fprintf('final clustering \n')
+rez                = final_clustering(rez, tF, st3);
+
+% final merges
+fprintf('final merges \n')
+rez                = find_merges(rez, 1);
+
+% decide on cutoff
+fprintf('decide on cutoff \n')
+rez = set_cutoff(rez);
+
+%fprintf('found %d good units \n', sum(rez.good>0))
+
+% write to Phy
+fprintf('Saving results to Phy  \n')
+rezToPhy(rez, rootZ);
+
+% if you want to save the results to a Matlab file...
+% discard features in final rez file (too slow to save)
+rez.cProj = [];
+rez.cProjPC = [];
+
+% save final results as rez2
+fprintf('Saving final results in rez2  \n')
+fname = fullfile(rootZ, 'rez2.mat');
+save(fname, 'rez', '-v7.3');
+
+concat_cmd = 'rm '+rootZ+binary_filename;
+disp(concat_cmd);
+system(concat_cmd);
+
+close all;
